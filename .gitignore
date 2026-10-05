@@ -1,0 +1,3 @@
+# local durable event log and demo artifacts
+/data/
+/.demo-tmp/

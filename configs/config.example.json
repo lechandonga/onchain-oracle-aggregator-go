@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "sources": {
+    "src-a": {"id": "src-a", "name": "Alpha Feed",   "key": "replace-with-secret-a", "active": true},
+    "src-b": {"id": "src-b", "name": "Bravo Feed",   "key": "replace-with-secret-b", "active": true},
+    "src-c": {"id": "src-c", "name": "Charlie Feed", "key": "replace-with-secret-c", "active": true},
+    "src-d": {"id": "src-d", "name": "Delta Feed",   "key": "replace-with-secret-d", "active": true}
+  },
+  "assets": {
+    "BTCUSD": {
+      "min_sources": 3,
+      "trim_low": 1,
+      "trim_high": 1,
+      "max_deviation_bp": 200,
+      "hard_floor_bp": 500,
+      "hard_ceiling_bp": 500,
+      "min_positive_price": 1
+    }
+  },
+  "submission_ttl": 30000000000,
+  "clock_skew": 2000000000,
+  "max_quote_staleness": 120000000000,
+  "fallback_staleness": 600000000000,
+  "on_restart_open_round": "resume"
+}
