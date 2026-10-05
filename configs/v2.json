@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "pair": "BTC/USD",
+  "sources": {
+    "src-a": {"id": "src-a", "secret": "secret-a", "weight": 1},
+    "src-b": {"id": "src-b", "secret": "secret-b", "weight": 1},
+    "src-c": {"id": "src-c", "secret": "secret-c", "weight": 1},
+    "src-d": {"id": "src-d", "secret": "secret-d", "weight": 2},
+    "src-e": {"id": "src-e", "secret": "secret-e", "weight": 1}
+  },
+  "rule": {
+    "min_sources": 3,
+    "max_staleness_ns": 20000000000,
+    "max_deviation_bps": 100,
+    "insufficient_policy": "fallback_last_confirmed",
+    "deviation_policy": "fallback_last_confirmed",
+    "hard_min_price": 95,
+    "hard_max_price": 105
+  }
+}
