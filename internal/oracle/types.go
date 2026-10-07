@@ -16,6 +16,9 @@ const (
 	RejectBadSignature       = "bad_signature"
 	RejectRoundClosed        = "round_closed"
 	RejectAssetUnknown       = "asset_not_configured"
+	// RejectAuthWindow means the source exists and is active, but the
+	// submission arrived outside its configured authorization window.
+	RejectAuthWindow = "source_auth_window"
 )
 
 // SourceConfig describes one authorized data source at a given config version.
@@ -24,7 +27,39 @@ type SourceConfig struct {
 	Name   string `json:"name"`
 	Key    string `json:"key"`
 	Active bool   `json:"active"`
+	// NotBefore / NotAfter bound the authorization window of this source.
+	// Semantics are fixed and identical everywhere: the window is
+	// [NotBefore, NotAfter) — NotBefore is inclusive, NotAfter is exclusive.
+	// A nil endpoint means unbounded on that side; a source with neither
+	// endpoint set is authorized whenever it is active (long-term valid).
+	// The window is evaluated against the engine clock at submission time,
+	// under the engine mutex, so concurrent submissions at the exact edge
+	// are serialized and always decided the same way.
+	NotBefore *time.Time `json:"not_before,omitempty"`
+	NotAfter  *time.Time `json:"not_after,omitempty"`
 }
+
+// WithinWindow reports whether at falls inside the authorization window.
+// Start inclusive, end exclusive: at == NotBefore is authorized,
+// at == NotAfter is not.
+func (s SourceConfig) WithinWindow(at time.Time) bool {
+	if s.NotBefore != nil && at.Before(*s.NotBefore) {
+		return false
+	}
+	if s.NotAfter != nil && !at.Before(*s.NotAfter) {
+		return false
+	}
+	return true
+}
+
+// Anomaly policies selectable per asset via AssetRule.OnAnomaly.
+const (
+	// AnomalyReject publishes nothing for the asset on an anomalous round.
+	AnomalyReject = "reject"
+	// AnomalyFallback reuses the most recent confirmed result, bounded by
+	// Config.FallbackStaleness.
+	AnomalyFallback = "fallback"
+)
 
 // AssetRule holds the aggregation parameters for one asset.
 type AssetRule struct {
@@ -46,6 +81,21 @@ type AssetRule struct {
 	// MinPositivePrice rejects non-positive prices as malformed at the
 	// aggregation stage.
 	MinPositivePrice Price `json:"min_positive_price"`
+	// OnAnomaly selects what happens when a round cannot produce a fresh
+	// result for this asset (too few sources, stale quotes, deviation too
+	// large): AnomalyReject publishes nothing; AnomalyFallback reuses the
+	// most recent confirmed result if it is younger than
+	// Config.FallbackStaleness. Empty means AnomalyFallback, which keeps
+	// pre-existing configs behaving exactly as before.
+	OnAnomaly string `json:"on_anomaly"`
+}
+
+// AnomalyPolicy resolves the effective policy, applying the default.
+func (r AssetRule) AnomalyPolicy() string {
+	if r.OnAnomaly == "" {
+		return AnomalyFallback
+	}
+	return r.OnAnomaly
 }
 
 // Config is one immutable, versioned set of sources and rules. Upgrades only
@@ -110,6 +160,7 @@ type AssetDecision struct {
 	Price          *Price               `json:"price_micros,omitempty"`
 	BasedOnRound   *uint64              `json:"based_on_round,omitempty"`
 	ConfigVersion  int64                `json:"config_version"`
+	AnomalyPolicy  string               `json:"anomaly_policy,omitempty"`
 	AcceptedQuotes []AcceptedSubmission `json:"accepted_quotes"`
 	OrderedPrices  []Price              `json:"ordered_prices"`
 	TrimmedPrices  []Price              `json:"trimmed_prices"`
@@ -129,19 +180,6 @@ type RoundReport struct {
 	ConfigVersion int64                    `json:"config_version"`
 	Status        RoundStatus              `json:"status"`
 	Decisions     map[string]AssetDecision `json:"decisions"`
-}
-
-// RejectedSubmission is returned for submissions that fail authorization.
-type RejectedSubmission struct {
-	SourceID string
-	Asset    string
-	Round    uint64
-	Reason   string
-	Detail   string
-}
-
-func (r RejectedSubmission) Error() string {
-	return "submission rejected: " + r.Reason
 }
 
 // RejectError lets callers distinguish rejection reasons programmatically.

@@ -56,16 +56,27 @@ func (c Config) Validate() error {
 			return fmt.Errorf("config v%d duplicate source %q", c.Version, id)
 		}
 		ids[id] = true
+		if s.NotBefore != nil && s.NotAfter != nil && !s.NotBefore.Before(*s.NotAfter) {
+			return fmt.Errorf("config v%d source %q not_before must be strictly before not_after", c.Version, id)
+		}
 	}
 	for asset, r := range c.Assets {
 		if r.MinSources <= 0 {
 			return fmt.Errorf("config v%d asset %q min_sources must be positive", c.Version, asset)
+		}
+		if r.MinPositivePrice <= 0 {
+			return fmt.Errorf("config v%d asset %q min_positive_price must be positive", c.Version, asset)
 		}
 		if r.MaxDeviationBasisPoints <= 0 {
 			return fmt.Errorf("config v%d asset %q max_deviation_bp must be positive", c.Version, asset)
 		}
 		if r.HardFloorBps < 0 || r.HardCeilingBps < 0 {
 			return fmt.Errorf("config v%d asset %q hard band bps must be non-negative", c.Version, asset)
+		}
+		switch r.OnAnomaly {
+		case "", AnomalyReject, AnomalyFallback:
+		default:
+			return fmt.Errorf("config v%d asset %q on_anomaly must be %q or %q, got %q", c.Version, asset, AnomalyReject, AnomalyFallback, r.OnAnomaly)
 		}
 	}
 	if c.SubmissionTTL <= 0 || c.MaxQuoteStaleness <= 0 || c.FallbackStaleness <= 0 {

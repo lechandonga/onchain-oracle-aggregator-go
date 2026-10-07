@@ -15,6 +15,14 @@ type openRound struct {
 	quotes   map[string]map[string]AcceptedSubmission
 }
 
+// lastConfirmed is the most recent freshly published (PUBLISHED) result of
+// an asset. FALLBACK never refreshes it, so reuse cannot extend its life.
+type lastConfirmed struct {
+	price Price
+	round uint64
+	pubAt time.Time
+}
+
 // Engine is the concurrency-safe aggregator. All state transitions are
 // durably appended to Store before being applied in memory.
 type Engine struct {
@@ -31,9 +39,7 @@ type Engine struct {
 	nonces  map[string]bool
 	subIDs  map[string]bool
 
-	lastPrice map[string]Price
-	lastRound map[string]uint64
-	lastPubAt map[string]time.Time
+	last map[string]lastConfirmed
 }
 
 func NewEngine(store Store, now func() time.Time) (*Engine, error) {
@@ -48,9 +54,7 @@ func NewEngine(store Store, now func() time.Time) (*Engine, error) {
 		voided:    map[uint64]bool{},
 		nonces:    map[string]bool{},
 		subIDs:    map[string]bool{},
-		lastPrice: map[string]Price{},
-		lastRound: map[string]uint64{},
-		lastPubAt: map[string]time.Time{},
+		last:      map[string]lastConfirmed{},
 	}
 	if err := e.recover(); err != nil {
 		return nil, err
@@ -61,6 +65,15 @@ func NewEngine(store Store, now func() time.Time) (*Engine, error) {
 func submissionID(s Submission) string {
 	sum := sha256.Sum256([]byte(SigningMessage(s.SourceID, s.Asset, s.Round, s.Price, s.QuoteTime, s.Nonce)))
 	return hex.EncodeToString(sum[:])
+}
+
+// authWindowDetail explains which window endpoint rejected the submission.
+func authWindowDetail(src SourceConfig, at time.Time) string {
+	atStr := at.UTC().Format(time.RFC3339Nano)
+	if src.NotBefore != nil && at.Before(*src.NotBefore) {
+		return sprintf("source %s not authorized before %s (now %s)", src.ID, src.NotBefore.UTC().Format(time.RFC3339Nano), atStr)
+	}
+	return sprintf("source %s authorization expired at %s (now %s, end exclusive)", src.ID, src.NotAfter.UTC().Format(time.RFC3339Nano), atStr)
 }
 
 func (e *Engine) InstallConfig(c Config) error {
@@ -175,14 +188,32 @@ func (e *Engine) closeRoundLocked(at time.Time) (*RoundReport, error) {
 		return nil, &RejectError{Reason: "config_missing", Detail: sprintf("v%d", e.open.cfgVer)}
 	}
 
+	// The report is a pure function of the open round, its bound config and
+	// the last confirmed results. No engine state is mutated until the
+	// finalized report is durably appended, so a failed append leaves the
+	// round open and the last-confirmed indexes untouched: the round is
+	// either fully finalized on disk or not finalized at all.
+	report := finalizeReport(e.open, cfg, at, e.last)
+	if err := e.store.Append(Event{Type: EvRoundFinalized, Round: report.Round, AtUnix: at.UnixNano(), ConfigVersion: cfg.Version, Report: report}); err != nil {
+		return nil, err
+	}
+	e.reports[report.Round] = report
+	e.open = nil
+	e.recordPublished(report)
+	return report, nil
+}
+
+// finalizeReport computes the round report deterministically. It is shared
+// by the engine and the audit verifier so a replayed round is recomputed by
+// exactly the same code that decided it.
+func finalizeReport(open *openRound, cfg Config, at time.Time, last map[string]lastConfirmed) *RoundReport {
 	report := &RoundReport{
-		Round:         e.open.round,
-		OpenedAt:      e.open.openedAt,
+		Round:         open.round,
+		OpenedAt:      open.openedAt,
 		ClosedAt:      at,
-		ConfigVersion: e.open.cfgVer,
+		ConfigVersion: open.cfgVer,
 		Decisions:     map[string]AssetDecision{},
 	}
-
 	assets := make([]string, 0, len(cfg.Assets))
 	for a := range cfg.Assets {
 		assets = append(assets, a)
@@ -192,13 +223,18 @@ func (e *Engine) closeRoundLocked(at time.Time) (*RoundReport, error) {
 	overall := RoundPublished
 	for _, asset := range assets {
 		rule := cfg.Assets[asset]
-		bySource := e.open.quotes[asset]
+		bySource := open.quotes[asset]
 
 		fresh := make([]AcceptedSubmission, 0, len(bySource))
 		staleIDs := []string{}
+		belowMinIDs := []string{}
 		for srcID, q := range bySource {
 			if at.Sub(q.QuoteTime) > cfg.MaxQuoteStaleness {
 				staleIDs = append(staleIDs, srcID)
+				continue
+			}
+			if q.Price < rule.MinPositivePrice {
+				belowMinIDs = append(belowMinIDs, srcID)
 				continue
 			}
 			fresh = append(fresh, q)
@@ -213,23 +249,36 @@ func (e *Engine) closeRoundLocked(at time.Time) (*RoundReport, error) {
 			return fresh[i].SubmissionID < fresh[j].SubmissionID
 		})
 		sort.Strings(staleIDs)
+		sort.Strings(belowMinIDs)
 
-		d := aggregate(asset, fresh, rule, cfg.Version, e.lastPricePtr(asset))
+		var lastPrice *Price
+		if lc, has := last[asset]; has {
+			p := lc.price
+			lastPrice = &p
+		}
+		d := aggregate(asset, fresh, rule, cfg.Version, lastPrice)
 		for _, id := range staleIDs {
 			d.Checks = append(d.Checks, checkf("dropped_stale_quote source=%s max_staleness=%s", id, cfg.MaxQuoteStaleness))
 		}
+		for _, id := range belowMinIDs {
+			d.Checks = append(d.Checks, checkf("dropped_below_min_positive_price source=%s min=%d", id, rule.MinPositivePrice))
+		}
 
 		if d.Status == RoundRejected {
-			if lp, has := e.lastPrice[asset]; has {
-				pubAt := e.lastPubAt[asset]
-				age := at.Sub(pubAt)
+			policy := rule.AnomalyPolicy()
+			d.AnomalyPolicy = policy
+			d.Checks = append(d.Checks, checkf("anomaly_policy=%s trigger=%s", policy, d.RejectReason))
+			if policy == AnomalyReject {
+				d.Checks = append(d.Checks, "anomaly_policy=reject: publish nothing this round")
+			} else if lc, has := last[asset]; has {
+				age := at.Sub(lc.pubAt)
 				if age <= cfg.FallbackStaleness {
-					based := e.lastRound[asset]
+					based := lc.round
 					d.Status = RoundFallback
-					p := lp
+					p := lc.price
 					d.Price = &p
 					d.BasedOnRound = &based
-					d.Checks = append(d.Checks, checkf("fallback to round=%d price=%d age=%s within=%s", based, lp, age, cfg.FallbackStaleness))
+					d.Checks = append(d.Checks, checkf("fallback to round=%d price=%d age=%s within=%s", based, lc.price, age, cfg.FallbackStaleness))
 				} else {
 					d.Checks = append(d.Checks, checkf("fallback refused: last result age=%s exceeds=%s", age, cfg.FallbackStaleness))
 				}
@@ -238,11 +287,6 @@ func (e *Engine) closeRoundLocked(at time.Time) (*RoundReport, error) {
 			}
 		}
 
-		if d.Status == RoundPublished {
-			e.lastPrice[asset] = *d.Price
-			e.lastRound[asset] = report.Round
-			e.lastPubAt[asset] = at
-		}
 		switch d.Status {
 		case RoundRejected:
 			overall = RoundRejected
@@ -254,20 +298,7 @@ func (e *Engine) closeRoundLocked(at time.Time) (*RoundReport, error) {
 		report.Decisions[asset] = d
 	}
 	report.Status = overall
-
-	if err := e.store.Append(Event{Type: EvRoundFinalized, Round: report.Round, AtUnix: at.UnixNano(), ConfigVersion: cfg.Version, Report: report}); err != nil {
-		return nil, err
-	}
-	e.reports[report.Round] = report
-	e.open = nil
-	return report, nil
-}
-
-func (e *Engine) lastPricePtr(asset string) *Price {
-	if p, ok := e.lastPrice[asset]; ok {
-		return &p
-	}
-	return nil
+	return report
 }
 
 func (e *Engine) Submit(s Submission) (AcceptedSubmission, error) {
@@ -291,13 +322,16 @@ func (e *Engine) Submit(s Submission) (AcceptedSubmission, error) {
 	if !authorized {
 		return AcceptedSubmission{}, &RejectError{Reason: RejectUnauthorized, Detail: sprintf("source %s not active in config v%d", s.SourceID, cfg.Version)}
 	}
+	now := e.now()
+	if !src.WithinWindow(now) {
+		return AcceptedSubmission{}, &RejectError{Reason: RejectAuthWindow, Detail: authWindowDetail(src, now)}
+	}
 	if _, known := cfg.Assets[s.Asset]; !known {
 		return AcceptedSubmission{}, &RejectError{Reason: RejectAssetUnknown, Detail: s.Asset}
 	}
 	if err := verifySignature(src.Key, s); err != nil {
 		return AcceptedSubmission{}, err
 	}
-	now := e.now()
 	if age := now.Sub(s.QuoteTime); age > cfg.SubmissionTTL {
 		return AcceptedSubmission{}, &RejectError{Reason: RejectExpired, Detail: sprintf("quote age %s > ttl %s", age, cfg.SubmissionTTL)}
 	}
@@ -361,11 +395,11 @@ func (e *Engine) Reports() []RoundReport {
 func (e *Engine) LatestPrice(asset string) (Price, uint64, time.Time, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	p, ok := e.lastPrice[asset]
+	lc, ok := e.last[asset]
 	if !ok {
 		return 0, 0, time.Time{}, false
 	}
-	return p, e.lastRound[asset], e.lastPubAt[asset], true
+	return lc.price, lc.round, lc.pubAt, true
 }
 
 func (e *Engine) IsVoided(round uint64) bool {

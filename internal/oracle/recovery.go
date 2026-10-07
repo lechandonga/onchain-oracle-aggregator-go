@@ -20,7 +20,7 @@ func (e *Engine) recover() error {
 		case EvRoundOpened:
 			pendingOpen = &openRound{
 				round:    ev.Round,
-				openedAt: time.Unix(0, ev.AtUnix),
+				openedAt: time.Unix(0, ev.AtUnix).UTC(),
 				cfgVer:   ev.ConfigVersion,
 				quotes:   map[string]map[string]AcceptedSubmission{},
 			}
@@ -93,9 +93,7 @@ func (e *Engine) recordPublished(r *RoundReport) {
 	for _, a := range assets {
 		d := r.Decisions[a]
 		if d.Status == RoundPublished && d.Price != nil {
-			e.lastPrice[a] = *d.Price
-			e.lastRound[a] = r.Round
-			e.lastPubAt[a] = r.ClosedAt
+			e.last[a] = lastConfirmed{price: *d.Price, round: r.Round, pubAt: r.ClosedAt}
 		}
 	}
 }

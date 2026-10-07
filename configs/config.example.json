@@ -4,7 +4,8 @@
     "src-a": {"id": "src-a", "name": "Alpha Feed",   "key": "replace-with-secret-a", "active": true},
     "src-b": {"id": "src-b", "name": "Bravo Feed",   "key": "replace-with-secret-b", "active": true},
     "src-c": {"id": "src-c", "name": "Charlie Feed", "key": "replace-with-secret-c", "active": true},
-    "src-d": {"id": "src-d", "name": "Delta Feed",   "key": "replace-with-secret-d", "active": true}
+    "src-d": {"id": "src-d", "name": "Delta Feed",   "key": "replace-with-secret-d", "active": true,
+      "not_before": "2026-01-01T00:00:00Z", "not_after": "2027-01-01T00:00:00Z"}
   },
   "assets": {
     "BTCUSD": {
@@ -14,7 +15,8 @@
       "max_deviation_bp": 200,
       "hard_floor_bp": 500,
       "hard_ceiling_bp": 500,
-      "min_positive_price": 1
+      "min_positive_price": 1,
+      "on_anomaly": "fallback"
     }
   },
   "submission_ttl": 30000000000,
